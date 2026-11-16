@@ -1,0 +1,30 @@
+# Example: run the token issuer on its own.
+#   docker compose -f docker-compose.example.yml up --build
+#   curl http://localhost:9000/health
+#
+# To run it next to your API, copy this file into your project and add your
+# API service (see the commented block at the bottom).
+
+services:
+  token-issuer:
+    build: .
+    ports:
+      - "127.0.0.1:9000:9000"    # this computer only
+    environment:
+      ISSUER: http://localhost:9000
+      AUDIENCE: cs763-api
+      ALG: RS256
+    volumes:
+      - issuer-keys:/app/keys    # keeps the same keys across restarts
+
+  # api:
+  #   build: ../secure-codebase  # your API
+  #   depends_on:
+  #     - token-issuer
+  #   environment:
+  #     JWT_JWK_SET_URI: http://token-issuer:9000/.well-known/jwks.json
+  #     JWT_ISSUER: http://localhost:9000
+  #     JWT_AUDIENCE: cs763-api
+
+volumes:
+  issuer-keys:
