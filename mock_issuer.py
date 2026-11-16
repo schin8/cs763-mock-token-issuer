@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Tool: Claude (Anthropic), via Claude Code
+# Prompt Summary: "Build a local mock JWT issuer for CS763 Assignment 3 with key
+#   generation, signed tokens, a JWKS endpoint, and labeled negative tokens."
+# AI Contribution: Initial draft (~90%)
+# Human Modifications:
+# - Reviewed the design and the negative test set against the course PDF
+# - Chose the README wording and the course-fit notes
+# - Accepted the fixes from a second AI review (input limits, kid lookup, clock skew)
+# Verification:
+# - pytest suite (tests/test_mock_issuer.py)
+# - PyJWT check (tests/verify_with_pyjwt.py)
+# - Docker build and healthcheck
+# Confidence: Medium
 """
 CS763 Mock Token Issuer
 
@@ -127,6 +140,8 @@ def load_keys(keys_dir: str, auto_alg: str = None):
     if not os.path.exists(priv_path):
         if auto_alg:
             keygen(keys_dir, auto_alg)
+            print(f"No key found in {keys_dir}. Generated a new {auto_alg} key pair.",
+                  file=sys.stderr)
         else:
             sys.exit(f"No key found at {priv_path}. Run: python mock_issuer.py keygen")
     with open(priv_path, "rb") as f:

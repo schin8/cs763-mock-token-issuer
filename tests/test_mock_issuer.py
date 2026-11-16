@@ -1,3 +1,12 @@
+# Tool: Claude (Anthropic), via Claude Code
+# Prompt Summary: "Write pytest tests for the mock token issuer: signatures, claims,
+#   negative set, HTTP input handling, and CLI behavior."
+# AI Contribution: Initial draft (~90%)
+# Human Modifications:
+# - Added the key-creation message test and reviewed the test names
+# Verification:
+# - Run with python -m pytest tests/ (23 tests passing at v1.0.0)
+# Confidence: Medium
 """Unit and HTTP tests for mock_issuer.py.
 
 Run from the repo root:
@@ -252,3 +261,21 @@ def test_serve_defaults_to_localhost(keys_dir, monkeypatch):
         proc.kill()
         proc.wait(timeout=5)
     assert "http://127.0.0.1:" in banner
+
+
+def test_serve_says_when_it_creates_keys(tmp_path):
+    """serve makes a key on first start and says so before the banner."""
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "mock_issuer.py"), "--keys-dir", str(tmp_path),
+         "serve", "--port", "0"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        lines = [proc.stdout.readline(), proc.stdout.readline()]
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+    assert "Generated a new RS256 key pair" in lines[0]
+    assert "http://127.0.0.1:" in lines[1]
+    assert os.path.exists(os.path.join(tmp_path, "private.pem"))
