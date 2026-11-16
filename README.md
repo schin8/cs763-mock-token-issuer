@@ -46,7 +46,7 @@ This shows the header and claims. It doesn't check the signature, so don't trust
 python mock_issuer.py negative --out negative-tokens.json
 ```
 
-Your service should accept the `valid` token and reject the rest. The [Negative tests](#negative-tests) table says what each one checks.
+Your service should accept the tokens marked `accept` and reject the rest. The [Negative tests](#negative-tests) table says what each one checks.
 
 ### Running it as a server
 
@@ -116,7 +116,7 @@ docker compose -f docker-compose.example.yml up --build
 curl http://localhost:9000/health
 ```
 
-The image runs as a non-root user and listens on all interfaces inside the container. The example publishes port 9000 as `127.0.0.1:9000:9000`, so only this computer can reach it. A bare `"9000:9000"` would publish it on every network interface.
+The image runs as a non-root user (uid 10001) and listens on all interfaces inside the container. If you bind-mount a folder from your computer at `/app/keys` instead of the named volume, that folder must be writable by uid 10001, or the container fails at startup. The example publishes port 9000 as `127.0.0.1:9000:9000`, so only this computer can reach it. A bare `"9000:9000"` would publish it on every network interface.
 
 To run it next to your API, copy `mock_issuer.py` and the `Dockerfile` into a folder in your repository, for example `token-issuer/`, then add a service:
 
@@ -125,7 +125,7 @@ services:
   token-issuer:
     build: ./token-issuer
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"        # this computer only
     environment:
       ISSUER: http://localhost:9000
       AUDIENCE: cs763-api
@@ -154,7 +154,7 @@ The `iss` value is just a string your service compares against. Use the same `IS
 |---|---|---|
 | GET | `/.well-known/jwks.json` | Public keys your service uses to verify signatures |
 | GET | `/.well-known/openid-configuration` | Discovery document |
-| POST | `/token` | Issue a token. Form or JSON body: `sub=alice&roles=user,admin&ttl=3600` |
+| POST | `/token` | Issue a token. Form or JSON body: `sub=alice&roles=user,admin&ttl=3600`. `ttl` must be a positive integer. `aud` overrides the audience for that one token. |
 | GET | `/negative?sub=alice&other_sub=bob` | Labeled good and bad tokens as JSON |
 | GET | `/health` | Status, issuer, audience, alg, kid |
 
@@ -186,7 +186,7 @@ If `ISSUE_SECRET` is set, `/token` and `/negative` also need the header `X-Issue
 | `wrong_issuer` | reject | `iss` validation |
 | `wrong_audience` | reject | `aud` validation |
 | `valid_aud_array` | accept | `aud` as an array that includes your audience (RFC 7519) |
-| `expired_30s` | reject | No clock-skew allowance. Accepting a token 30 seconds past `exp` is a bug unless you set a leeway on purpose |
+| `expired_2min` | reject | `exp` is 2 minutes in the past. That is beyond the 60 s clock skew that Spring and many libraries allow by default |
 | `alg_none` | reject | Algorithm allowlist blocks `none` |
 | `hs256_key_confusion` | reject | Algorithm allowlist blocks HS256 (attacker signs with your public key as an HMAC secret) |
 | `alg_not_allowed` | reject | Header names an algorithm that is not on your allowlist (PS256 here) |
@@ -209,7 +209,7 @@ Tokens are time-sensitive (`exp` defaults to one hour), so generate them at the 
 | Token lifetime (seconds) | `--ttl` | `TOKEN_TTL` | `3600` |
 | Port (serve) | `--port` | `PORT` | `9000` |
 | Bind address (serve) | `--host` | `HOST` | `127.0.0.1` (the Docker image sets `0.0.0.0`) |
-| Require a secret to issue | `--issue-secret` | `ISSUE_SECRET` | off |
+| Require a secret to issue | `--issue-secret` | `ISSUE_SECRET` | off (an empty value also means off) |
 
 Extra claims: `issue --sub alice --claim tenant=7 --claim email=alice@example.com`.
 The claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `roles`, and `scope` have their own flags, so `--claim` refuses them.

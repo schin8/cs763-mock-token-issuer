@@ -22,7 +22,7 @@ from mock_issuer import Handler, b64url_decode, load_keys, parse_extra  # noqa: 
 
 EXPECTED_NEGATIVE_NAMES = {
     "valid", "valid_other_user", "expired", "not_yet_valid", "missing_exp",
-    "wrong_issuer", "wrong_audience", "valid_aud_array", "expired_30s", "alg_none",
+    "wrong_issuer", "wrong_audience", "valid_aud_array", "expired_2min", "alg_none",
     "hs256_key_confusion", "bad_signature", "tampered_payload", "unknown_kid",
     "alg_not_allowed", "jku_injection", "malformed",
 }
@@ -170,6 +170,71 @@ def test_issue_secret_does_not_block_jwks(server):
     Handler.issue_secret = "s3cret"
     status, _ = request(server, "GET", "/.well-known/jwks.json")
     assert status == 200
+
+
+def test_non_numeric_ttl_returns_400(server):
+    status, body = request(server, "POST", "/token", body="sub=alice&ttl=abc",
+                           headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert status == 400
+    assert "ttl" in json.loads(body)["error_description"]
+
+
+def test_zero_or_negative_ttl_returns_400(server):
+    for ttl in ("0", "-5"):
+        status, _ = request(server, "POST", "/token", body=f"sub=alice&ttl={ttl}",
+                            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert status == 400, ttl
+
+
+def test_negative_content_length_returns_400(server):
+    status, _ = request(server, "POST", "/token", body="sub=alice",
+                        headers={"Content-Type": "application/x-www-form-urlencoded",
+                                 "Content-Length": "-1"})
+    assert status == 400
+
+
+def test_oversized_body_returns_413(server):
+    big = "sub=alice&pad=" + "x" * (mock_issuer.MAX_BODY_BYTES + 1)
+    status, _ = request(server, "POST", "/token", body=big,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert status == 413
+
+
+def test_null_or_object_claim_value_returns_400(server):
+    for body in ('{"sub": null}', '{"sub": {"a": 1}}'):
+        status, _ = request(server, "POST", "/token", body=body,
+                            headers={"Content-Type": "application/json"})
+        assert status == 400, body
+
+
+def test_unknown_kid_token_is_signed_by_the_real_key(keys_dir):
+    """The unknown_kid case must only fail a kid lookup, not the signature check."""
+    key, alg, jwk = load_keys(keys_dir)
+    case = mock_issuer.negative_tokens(key, alg, jwk)["unknown_kid"]
+    header, payload, sig = case["token"].split(".")
+    assert json.loads(b64url_decode(header))["kid"] == "unknown-key-id"
+    signing_input = f"{header}.{payload}".encode("ascii")
+    key.public_key().verify(b64url_decode(sig), signing_input,
+                            mock_issuer.padding.PKCS1v15(), mock_issuer.hashes.SHA256())
+
+
+def test_alg_none_token_carries_a_kid(keys_dir):
+    key, alg, jwk = load_keys(keys_dir)
+    token = mock_issuer.negative_tokens(key, alg, jwk)["alg_none"]["token"]
+    header = json.loads(b64url_decode(token.split(".")[0]))
+    assert header["alg"] == "none"
+    assert header["kid"] == jwk["kid"]
+
+
+def test_decode_rejects_bad_base64_with_a_message():
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, os.path.join(ROOT, "mock_issuer.py"), "decode", "a.b.c"],
+        capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert "Not a JWT" in proc.stderr
 
 
 def test_serve_defaults_to_localhost(keys_dir, monkeypatch):

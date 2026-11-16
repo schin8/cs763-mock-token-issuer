@@ -20,6 +20,7 @@ Only dependency: the "cryptography" package (pip install cryptography).
 
 import argparse
 import base64
+import binascii
 import functools
 import hashlib
 import hmac
@@ -221,11 +222,11 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
         "reject", "aud does not match the expected audience")
     add("valid_aud_array", encode_jwt(hdr, good(aud=[aud, "some-other-api"]), key, alg),
         "accept", "aud is an array that includes the expected audience (RFC 7519 allows this)")
-    add("expired_30s", encode_jwt(hdr, good(iat=now - 60, nbf=now - 60, exp=now - 30), key, alg),
-        "reject", "exp was 30 seconds ago. Reject it with no clock-skew allowance.")
+    add("expired_2min", encode_jwt(hdr, good(iat=now - 300, nbf=now - 300, exp=now - 120), key, alg),
+        "reject", "exp was 2 minutes ago. Past the 60 s clock skew that Spring and many libraries allow by default.")
 
     # alg=none: unsigned token
-    none_hdr = {"alg": "none", "typ": "JWT"}
+    none_hdr = {"alg": "none", "typ": "JWT", "kid": jwk["kid"]}
     add("alg_none", f"{b64url_json(none_hdr)}.{b64url_json(good())}.",
         "reject", "alg 'none' with no signature; must be blocked by the algorithm allowlist")
 
@@ -251,8 +252,10 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
         "Payload edited after signing (sub and roles changed); signature no longer matches")
 
     unk_hdr = dict(hdr, kid="unknown-key-id")
-    add("unknown_kid", encode_jwt(unk_hdr, good(), attacker, alg), "reject",
-        "kid not present in the JWKS")
+    # Signed with the issuer's real key, so only a kid lookup can reject it.
+    # A verifier that ignores kid and uses its one known key would accept this token.
+    add("unknown_kid", encode_jwt(unk_hdr, good(), key, alg), "reject",
+        "kid not present in the JWKS. Signed with the real key, so only a kid lookup catches it.")
 
     # Header claims an algorithm that is not on the allowlist
     ps_hdr = dict(hdr, alg="PS256")
@@ -270,8 +273,13 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
 
 # ---------------------------------------------------------------- server
 
+MAX_BODY_BYTES = 64 * 1024
+
+
 class BadRequest(Exception):
-    pass
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -279,6 +287,7 @@ class Handler(BaseHTTPRequestHandler):
     issuer = DEFAULT_ISSUER
     audience = DEFAULT_AUDIENCE
     issue_secret = None  # when set, /token and /negative need this in X-Issuer-Secret
+    timeout = 10  # seconds. A client that sends a short body and waits gets disconnected.
 
     def _send(self, code, body, ctype="application/json"):
         data = body if isinstance(body, bytes) else json.dumps(body, indent=2).encode()
@@ -297,6 +306,10 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 raise BadRequest("Content-Length must be a number")
+            if length < 0:
+                raise BadRequest("Content-Length must not be negative")
+            if length > MAX_BODY_BYTES:
+                raise BadRequest(f"body is larger than {MAX_BODY_BYTES} bytes", status=413)
             raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
             ctype = self.headers.get("Content-Type", "")
             if raw and "json" in ctype:
@@ -306,8 +319,15 @@ class Handler(BaseHTTPRequestHandler):
                     raise BadRequest("body is not valid JSON")
                 if not isinstance(body, dict):
                     raise BadRequest("JSON body must be an object")
-                params.update({k: ",".join(map(str, v)) if isinstance(v, list) else str(v)
-                               for k, v in body.items()})
+                for k, v in body.items():
+                    if isinstance(v, list):
+                        if not all(isinstance(x, (str, int)) for x in v):
+                            raise BadRequest(f"{k} must be a list of strings or numbers")
+                        params[k] = ",".join(map(str, v))
+                    elif isinstance(v, (str, int)) and not isinstance(v, bool):
+                        params[k] = str(v)
+                    else:
+                        raise BadRequest(f"{k} must be a string or a number")
             elif raw:
                 params.update({k: v[-1] for k, v in parse_qs(raw).items()})
         return url.path, params
@@ -316,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path, p = self._params()
         except BadRequest as e:
-            return self._send(400, {"error": "invalid_request", "error_description": str(e)})
+            return self._send(e.status, {"error": "invalid_request", "error_description": str(e)})
         if path == "/token" and self.command != "POST":
             return self._send(405, {"error": "method_not_allowed", "error_description": "use POST /token"})
         if path in ("/token", "/negative") and self.issue_secret:
@@ -344,7 +364,12 @@ class Handler(BaseHTTPRequestHandler):
             if not sub:
                 return self._send(400, {"error": "invalid_request", "error_description": "sub is required"})
             roles = [r for r in p.get("roles", "user").split(",") if r]
-            ttl = int(p.get("ttl", DEFAULT_TTL))
+            try:
+                ttl = int(p.get("ttl", DEFAULT_TTL))
+            except ValueError:
+                return self._send(400, {"error": "invalid_request", "error_description": "ttl must be an integer"})
+            if ttl <= 0:
+                return self._send(400, {"error": "invalid_request", "error_description": "ttl must be greater than 0"})
             token = issue_token(self.key, self.alg, self.jwk, sub=sub, roles=roles,
                                 iss=self.issuer, aud=p.get("aud", self.audience), ttl=ttl)
             return self._send(200, {"access_token": token, "token_type": "Bearer", "expires_in": ttl})
@@ -479,8 +504,12 @@ def main(argv=None):
         parts = a.token.split(".")
         if len(parts) != 3:
             sys.exit("Not a JWT (expected 3 parts)")
-        print(json.dumps({"header": json.loads(b64url_decode(parts[0])),
-                          "payload": json.loads(b64url_decode(parts[1]))}, indent=2))
+        try:
+            header = json.loads(b64url_decode(parts[0]))
+            payload = json.loads(b64url_decode(parts[1]))
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            sys.exit("Not a JWT (header or payload is not valid base64url JSON)")
+        print(json.dumps({"header": header, "payload": payload}, indent=2))
     elif a.cmd == "serve":
         serve(a.host, a.port, a.keys_dir, a.alg, a.iss, a.aud, a.issue_secret)
 
