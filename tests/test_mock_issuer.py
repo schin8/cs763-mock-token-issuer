@@ -269,7 +269,7 @@ def test_serve_says_when_it_creates_keys(tmp_path):
 
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "mock_issuer.py"), "--keys-dir", str(tmp_path),
-         "serve", "--port", "0"],
+         "serve", "--port", "0", "--alg", "RS256", "--host", "127.0.0.1"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         lines = [proc.stdout.readline(), proc.stdout.readline()]
