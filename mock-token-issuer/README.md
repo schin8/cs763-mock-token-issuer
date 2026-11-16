@@ -4,6 +4,74 @@ A key-generation and mock token issuer tool for Project Assignment 3. It stands 
 
 **For local development and testing only.** Do not deploy it or reuse its keys anywhere else.
 
+## Start here
+
+You need Python 3.9 or newer. These five steps take about five minutes.
+
+**1. Install the one library the tool needs.**
+
+```bash
+pip install cryptography
+```
+
+**2. Create a signing key (you only do this once).**
+
+```bash
+python mock_issuer.py keygen
+```
+
+This writes three files to a `keys/` folder: `private.pem` (secret), `public.pem`, and `jwks.json` (the public part your service reads). Never commit `private.pem`. The `keys/` folder is already in `.gitignore`.
+
+**3. Get a token for a test user.**
+
+```bash
+python mock_issuer.py issue --sub alice
+```
+
+The tool prints one long string. That's a signed token for "alice".
+
+**4. Look inside a token (optional).**
+
+```bash
+python mock_issuer.py decode <paste-your-token-here>
+```
+
+This shows the header and claims. It doesn't check the signature, so don't trust it for security decisions.
+
+**5. Make the test set for your service.**
+
+```bash
+python mock_issuer.py negative --out negative-tokens.json
+```
+
+Your service should accept the `valid` token and reject the rest. The [Negative tests](#negative-tests) table says what each one checks.
+
+### Running it as a server
+
+If your service needs to fetch keys over HTTP, start the server:
+
+```bash
+python mock_issuer.py serve
+```
+
+It listens on `http://localhost:9000`. In another terminal, check that it's up:
+
+```bash
+curl http://localhost:9000/health
+```
+
+The server listens on all network interfaces, so run it only on a network you trust. Stop it with Ctrl+C.
+
+### Something went wrong?
+
+| What you see | What to do |
+|---|---|
+| `No key found at keys/private.pem` | Run step 2 (`keygen`) first. |
+| `keys/private.pem already exists` | Your keys are already there. Use them, or add `--force` to replace them. Tokens from the old key stop verifying. |
+| `Missing dependency. Run: pip install cryptography` | Run step 1. |
+| `Connection refused` on port 9000 | The server isn't running. Start it with `serve`. |
+| Your API rejects the `valid` token | Check that your API's issuer and audience match `ISSUER` and `AUDIENCE`, and that its JWKS URL points at this server. |
+
 ## What it does
 
 - Generates an RS256 (RSA 2048) or ES256 (P-256) signing key pair and a JWKS file
@@ -11,9 +79,9 @@ A key-generation and mock token issuer tool for Project Assignment 3. It stands 
 - Produces a set of labeled bad tokens for your negative tests (expired, wrong issuer, wrong audience, `alg: none`, HS256 key confusion, bad signature, tampered payload, and more)
 - Runs a small HTTP server with a JWKS endpoint and a token endpoint, so it can run as a service in Docker Compose
 
-The only dependency is Python 3.9+ and the `cryptography` package.
+The tool needs Python 3.9+ and the `cryptography` package. The test script in `tests/` also needs `pyjwt`.
 
-## Quick start (command line)
+## Command reference
 
 ```bash
 pip install cryptography
