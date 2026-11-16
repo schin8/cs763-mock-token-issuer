@@ -20,10 +20,13 @@ Only dependency: the "cryptography" package (pip install cryptography).
 
 import argparse
 import base64
+import binascii
+import functools
 import hashlib
 import hmac
 import json
 import os
+import socketserver
 import sys
 import time
 import uuid
@@ -177,6 +180,12 @@ def issue_token(key, alg, jwk, **kwargs) -> str:
 
 # ---------------------------------------------------------------- negative tests
 
+@functools.lru_cache(maxsize=None)
+def _attacker_key(alg: str):
+    """A key the issuer does not trust. Made once per process, since RSA keygen is slow."""
+    return generate_private_key(alg)
+
+
 def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
                     aud=DEFAULT_AUDIENCE, other_sub="bob") -> dict:
     """Return labeled tokens. Your service should accept only the ones marked 'accept'."""
@@ -211,9 +220,13 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
         "reject", "iss does not match the expected issuer")
     add("wrong_audience", encode_jwt(hdr, good(aud="some-other-api"), key, alg),
         "reject", "aud does not match the expected audience")
+    add("valid_aud_array", encode_jwt(hdr, good(aud=[aud, "some-other-api"]), key, alg),
+        "accept", "aud is an array that includes the expected audience (RFC 7519 allows this)")
+    add("expired_2min", encode_jwt(hdr, good(iat=now - 300, nbf=now - 300, exp=now - 120), key, alg),
+        "reject", "exp was 2 minutes ago. Past the 60 s clock skew that Spring and many libraries allow by default.")
 
     # alg=none: unsigned token
-    none_hdr = {"alg": "none", "typ": "JWT"}
+    none_hdr = {"alg": "none", "typ": "JWT", "kid": jwk["kid"]}
     add("alg_none", f"{b64url_json(none_hdr)}.{b64url_json(good())}.",
         "reject", "alg 'none' with no signature; must be blocked by the algorithm allowlist")
 
@@ -227,7 +240,7 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
         "HS256 signed with the public key as the HMAC secret (algorithm confusion attack)")
 
     # Signed by a different key but claims our kid
-    attacker = generate_private_key(alg)
+    attacker = _attacker_key(alg)
     add("bad_signature", encode_jwt(hdr, good(), attacker, alg), "reject",
         "Signed by an attacker's key while claiming the issuer's kid")
 
@@ -239,8 +252,20 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
         "Payload edited after signing (sub and roles changed); signature no longer matches")
 
     unk_hdr = dict(hdr, kid="unknown-key-id")
-    add("unknown_kid", encode_jwt(unk_hdr, good(), attacker, alg), "reject",
-        "kid not present in the JWKS")
+    # Signed with the issuer's real key, so only a kid lookup can reject it.
+    # A verifier that ignores kid and uses its one known key would accept this token.
+    add("unknown_kid", encode_jwt(unk_hdr, good(), key, alg), "reject",
+        "kid not present in the JWKS. Signed with the real key, so only a kid lookup catches it.")
+
+    # Header claims an algorithm that is not on the allowlist
+    ps_hdr = dict(hdr, alg="PS256")
+    add("alg_not_allowed", encode_jwt(ps_hdr, good(), key, alg), "reject",
+        "Header says PS256, which is not on the allowlist. The signature is also wrong for PS256.")
+
+    # Header asks the verifier to fetch keys from an attacker's URL
+    jku_hdr = dict(hdr, jku="https://evil.example.com/jwks.json")
+    add("jku_injection", encode_jwt(jku_hdr, good(), attacker, alg), "reject",
+        "jku header points at an attacker's key set. Verifiers must use their own trusted JWKS URL only.")
 
     add("malformed", "not.a.jwt", "reject", "Not a valid JWT")
     return out
@@ -248,10 +273,21 @@ def negative_tokens(key, alg, jwk, sub="alice", roles=None, iss=DEFAULT_ISSUER,
 
 # ---------------------------------------------------------------- server
 
+MAX_BODY_BYTES = 64 * 1024
+
+
+class BadRequest(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
 class Handler(BaseHTTPRequestHandler):
     key = alg = jwk = None
     issuer = DEFAULT_ISSUER
     audience = DEFAULT_AUDIENCE
+    issue_secret = None  # when set, /token and /negative need this in X-Issuer-Secret
+    timeout = 10  # seconds. A client that sends a short body and waits gets disconnected.
 
     def _send(self, code, body, ctype="application/json"):
         data = body if isinstance(body, bytes) else json.dumps(body, indent=2).encode()
@@ -266,18 +302,48 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         params = {k: v[-1] for k, v in parse_qs(url.query).items()}
         if self.command == "POST":
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length).decode() if length else ""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                raise BadRequest("Content-Length must be a number")
+            if length < 0:
+                raise BadRequest("Content-Length must not be negative")
+            if length > MAX_BODY_BYTES:
+                raise BadRequest(f"body is larger than {MAX_BODY_BYTES} bytes", status=413)
+            raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
             ctype = self.headers.get("Content-Type", "")
             if raw and "json" in ctype:
-                params.update({k: str(v) if not isinstance(v, list) else ",".join(v)
-                               for k, v in json.loads(raw).items()})
+                try:
+                    body = json.loads(raw)
+                except json.JSONDecodeError:
+                    raise BadRequest("body is not valid JSON")
+                if not isinstance(body, dict):
+                    raise BadRequest("JSON body must be an object")
+                for k, v in body.items():
+                    if isinstance(v, list):
+                        if not all(isinstance(x, (str, int)) for x in v):
+                            raise BadRequest(f"{k} must be a list of strings or numbers")
+                        params[k] = ",".join(map(str, v))
+                    elif isinstance(v, (str, int)) and not isinstance(v, bool):
+                        params[k] = str(v)
+                    else:
+                        raise BadRequest(f"{k} must be a string or a number")
             elif raw:
                 params.update({k: v[-1] for k, v in parse_qs(raw).items()})
         return url.path, params
 
     def _route(self):
-        path, p = self._params()
+        try:
+            path, p = self._params()
+        except BadRequest as e:
+            return self._send(e.status, {"error": "invalid_request", "error_description": str(e)})
+        if path == "/token" and self.command != "POST":
+            return self._send(405, {"error": "method_not_allowed", "error_description": "use POST /token"})
+        if path in ("/token", "/negative") and self.issue_secret:
+            given = self.headers.get("X-Issuer-Secret", "")
+            if not hmac.compare_digest(given.encode(), self.issue_secret.encode()):
+                return self._send(401, {"error": "unauthorized",
+                                        "error_description": "missing or wrong X-Issuer-Secret header"})
         if path in ("/", "/health"):
             return self._send(200, {"status": "ok", "issuer": self.issuer, "audience": self.audience,
                                     "alg": self.alg, "kid": self.jwk["kid"]})
@@ -298,7 +364,12 @@ class Handler(BaseHTTPRequestHandler):
             if not sub:
                 return self._send(400, {"error": "invalid_request", "error_description": "sub is required"})
             roles = [r for r in p.get("roles", "user").split(",") if r]
-            ttl = int(p.get("ttl", DEFAULT_TTL))
+            try:
+                ttl = int(p.get("ttl", DEFAULT_TTL))
+            except ValueError:
+                return self._send(400, {"error": "invalid_request", "error_description": "ttl must be an integer"})
+            if ttl <= 0:
+                return self._send(400, {"error": "invalid_request", "error_description": "ttl must be greater than 0"})
             token = issue_token(self.key, self.alg, self.jwk, sub=sub, roles=roles,
                                 iss=self.issuer, aud=p.get("aud", self.audience), ttl=ttl)
             return self._send(200, {"access_token": token, "token_type": "Bearer", "expires_in": ttl})
@@ -316,15 +387,30 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[mock-issuer] " + (fmt % args) + "\n")
 
 
-def serve(host, port, keys_dir, alg, issuer, audience):
+class IssuerServer(ThreadingHTTPServer):
+    """Same as ThreadingHTTPServer, but skips a reverse DNS lookup on bind.
+
+    HTTPServer.server_bind calls socket.getfqdn(), which can stall for 30+ seconds
+    on some machines before the server starts. The server name is not used here.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+def serve(host, port, keys_dir, alg, issuer, audience, issue_secret=None):
     key, alg, jwk = load_keys(keys_dir, auto_alg=alg)
     Handler.key, Handler.alg, Handler.jwk = key, alg, jwk
     Handler.issuer, Handler.audience = issuer, audience
-    srv = ThreadingHTTPServer((host, port), Handler)
+    Handler.issue_secret = issue_secret or None
+    srv = IssuerServer((host, port), Handler)
     print(f"Mock token issuer on http://{host}:{port}  (alg={alg}, kid={jwk['kid']})", flush=True)
     print(f"  issuer:   {issuer}\n  audience: {audience}", flush=True)
     print("  GET  /.well-known/jwks.json\n  GET  /.well-known/openid-configuration", flush=True)
     print("  POST /token  (sub=alice&roles=user)\n  GET  /negative?sub=alice", flush=True)
+    if issue_secret:
+        print("  /token and /negative need the X-Issuer-Secret header", flush=True)
     print("FOR LOCAL DEVELOPMENT AND TESTING ONLY", flush=True)
     try:
         srv.serve_forever()
@@ -334,12 +420,17 @@ def serve(host, port, keys_dir, alg, issuer, audience):
 
 # ---------------------------------------------------------------- CLI
 
+RESERVED_CLAIMS = {"iss", "sub", "aud", "iat", "nbf", "exp", "jti", "roles", "scope"}
+
+
 def parse_extra(pairs):
     extra = {}
     for item in pairs or []:
         if "=" not in item:
             sys.exit(f"--claim expects key=value, got {item!r}")
         k, v = item.split("=", 1)
+        if k in RESERVED_CLAIMS:
+            sys.exit(f"--claim {k} is reserved. Use --sub, --roles, --iss, --aud, or --ttl instead.")
         try:
             extra[k] = json.loads(v)
         except json.JSONDecodeError:
@@ -375,12 +466,15 @@ def main(argv=None):
     d.add_argument("token")
 
     s = sub.add_parser("serve", help="run JWKS and token endpoints")
-    s.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    s.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
+                   help="default 127.0.0.1 (this machine only). Use 0.0.0.0 inside Docker.")
     s.add_argument("--port", type=int, default=int(os.environ.get("PORT", "9000")))
     s.add_argument("--alg", choices=SUPPORTED_ALGS, default=DEFAULT_ALG,
                    help="used only if keys do not exist yet")
     s.add_argument("--iss", default=DEFAULT_ISSUER)
     s.add_argument("--aud", default=DEFAULT_AUDIENCE)
+    s.add_argument("--issue-secret", default=os.environ.get("ISSUE_SECRET"),
+                   help="if set, /token and /negative require this in the X-Issuer-Secret header")
 
     a = ap.parse_args(argv)
 
@@ -410,10 +504,14 @@ def main(argv=None):
         parts = a.token.split(".")
         if len(parts) != 3:
             sys.exit("Not a JWT (expected 3 parts)")
-        print(json.dumps({"header": json.loads(b64url_decode(parts[0])),
-                          "payload": json.loads(b64url_decode(parts[1]))}, indent=2))
+        try:
+            header = json.loads(b64url_decode(parts[0]))
+            payload = json.loads(b64url_decode(parts[1]))
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            sys.exit("Not a JWT (header or payload is not valid base64url JSON)")
+        print(json.dumps({"header": header, "payload": payload}, indent=2))
     elif a.cmd == "serve":
-        serve(a.host, a.port, a.keys_dir, a.alg, a.iss, a.aud)
+        serve(a.host, a.port, a.keys_dir, a.alg, a.iss, a.aud, a.issue_secret)
 
 
 if __name__ == "__main__":
