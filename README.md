@@ -64,6 +64,8 @@ curl http://localhost:9000/health
 
 By default the server only accepts connections from this computer. Stop it with Ctrl+C.
 
+If there are no keys yet, `serve` creates them and prints `No key found in keys. Generated a new RS256 key pair.` If you already ran `keygen`, it uses those keys. The Docker image relies on this to start with no setup.
+
 ### Something went wrong?
 
 | What you see | What to do |
@@ -236,3 +238,4 @@ See `examples/spring-boot/SecurityConfigExample.java` for a resource server conf
 - `roles` is a JSON array, and `scope` repeats the roles as a space-separated string, so either style of authority mapping works.
 - `kid` is the RFC 7638 thumbprint of the public key, so it changes when you regenerate keys.
 - If you regenerate keys, restart your API or let it refetch the JWKS.
+- The source files start with an AI contribution header, as the CS763 AI logging policy asks for AI-generated code. Your own project files need their own headers and AI usage log.

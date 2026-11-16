@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# Tool: Claude (Anthropic), via Claude Code
+# Prompt Summary: "Check every labeled token from the mock issuer against PyJWT,
+#   using the kid to pick the key."
+# AI Contribution: Initial draft (~90%)
+# Human Modifications:
+# - Replaced the first version, which skipped the unknown_kid check
+# Verification:
+# - Run for RS256 and ES256 (ALL OK at v1.0.0)
+# Confidence: Medium
 """Check every labeled token from mock_issuer.py against PyJWT.
 
 Run from anywhere:

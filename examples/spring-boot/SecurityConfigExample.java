@@ -1,3 +1,13 @@
+// Tool: Claude (Anthropic), via Claude Code
+// Prompt Summary: "Write a Spring Boot resource server config that checks JWTs from
+//   the mock token issuer's JWKS endpoint."
+// AI Contribution: Initial draft (~90%)
+// Human Modifications:
+// - Adapt package names and paths to your project
+// Verification:
+// - Not compiled or run yet (see the README and the improvement plan)
+// Confidence: Low
+//
 // Example only. Adapt package names and paths to your project.
 // Requires: spring-boot-starter-oauth2-resource-server
 //
